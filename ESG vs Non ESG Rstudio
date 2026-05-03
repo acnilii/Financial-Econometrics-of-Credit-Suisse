@@ -1,0 +1,192 @@
+# Code for Rstudio
+# ============================================================
+# Master Thesis - Static Cross-Sectional Analysis
+# ESG vs Traditional Indices
+# ============================================================
+
+# ---- 1. Install and load packages ----
+# Run install.packages(...) ONLY the first time. After that, comment them out.
+install.packages(c("readxl", "dplyr", "tidyr", "ggplot2", "tseries", "lmtest", "sandwich", "stringr"))
+
+library(readxl)    # read Excel files
+library(dplyr)     # data manipulation
+library(tidyr)     # reshape data
+library(ggplot2)   # plots
+library(tseries)   # ADF and KPSS unit root tests
+library(lmtest)    # robust regression diagnostics
+library(sandwich)  # robust standard errors
+library(stringr)   # string handling
+
+# ---- 2. Define index metadata ----
+# ESG dummy = 1 if file name starts with "ESG" or contains an ESG label
+# (FTSE4Good and MSCI KLD are also ESG-labelled products even without "ESG" in the name)
+indices <- tibble::tribble(
+  ~file,                          ~index_name,             ~esg_dummy, ~esg_score,
+  "FTSE All World.xlsx",          "FTSE All World",        0,          NA_real_,
+  "FTSE4Good All World.xlsx",     "FTSE4Good All World",   1,          NA_real_,
+  "MSCI KLD Good.xlsx",           "MSCI KLD 400 Social",   1,          NA_real_,
+  "MSCI US.xlsx",                 "MSCI US",               0,          NA_real_,
+  "MSCI World ESG.xlsx",          "MSCI World ESG",        1,          NA_real_,
+  "MSCI World.xlsx",              "MSCI World",            0,          NA_real_,
+  "Stoxx ESG.xlsx",               "STOXX Global ESG",      1,          NA_real_,
+  "Stoxx Global.xlsx",            "STOXX Global 1800",     0,          NA_real_
+)
+
+# >>> ACTION REQUIRED: Fill in esg_score values for ESG-labelled indices <
+# Example: indices$esg_score[indices$index_name == "MSCI World ESG"] <- 7.8
+# Get scores from MSCI/FTSE/STOXX factsheets. For non-ESG indices, you can
+# either leave NA (they will be excluded from the score regression) OR
+# fill in the underlying parent index ESG score if available.
+
+# ---- 3. Function to read one index file ----
+# Your screenshot shows the price history starts at row 19 (headers) / row 20 (data).
+# Columns: Exchange Date | Close | Net | %Chg | Open | Low | High
+read_index <- function(filepath) {
+  raw <- read_excel(
+    filepath,
+    sheet = 1,
+    skip  = 18,           # skip the 18 header/metadata rows -> row 19 becomes column names
+    col_names = TRUE
+  )
+
+  # Keep only Date and Close, rename for clarity
+  df <- raw %>%
+    select(date = `Exchange Date`, close = Close) %>%
+    filter(!is.na(date), !is.na(close)) %>%
+    mutate(
+      date  = as.Date(date),
+      close = as.numeric(close)
+    ) %>%
+    arrange(date)
+
+  return(df)
+}
+
+# ---- 4. Read all files and build the panel of returns ----
+data_folder <- "data"   # relative to your RStudio project folder
+
+all_returns <- list()
+
+for (i in seq_len(nrow(indices))) {
+  fp <- file.path(data_folder, indices$file[i])
+  message("Reading: ", fp)
+
+  df <- read_index(fp)
+
+  # Compute monthly log returns: ln(P_t / P_{t-1})
+  df <- df %>%
+    mutate(
+      log_return = log(close / lag(close)),
+      index_name = indices$index_name[i],
+      esg_dummy  = indices$esg_dummy[i],
+      esg_score  = indices$esg_score[i]
+    ) %>%
+    filter(!is.na(log_return))
+
+  all_returns[[i]] <- df
+}
+
+panel <- bind_rows(all_returns)
+
+# Quick check
+cat("\n--- Panel summary ---\n")
+print(panel %>% group_by(index_name) %>%
+        summarise(n_obs = n(), start = min(date), end = max(date)))
+
+# ---- 5. Risk-free rate (1-month US T-Bill) ----
+# OPTION A (manual): download from FRED series "TB4WK" or "DGS1MO", save as data/risk_free.xlsx
+#                    with columns: date, rf_annual_pct
+# OPTION B (quick start): use a constant approximation just to test the pipeline.
+#
+# The code below uses OPTION B as a placeholder. REPLACE with OPTION A for your
+# final thesis - using a constant rf will bias your excess returns.
+
+# --- OPTION B placeholder (REPLACE with real data before final analysis) ---
+panel <- panel %>%
+  mutate(
+    rf_monthly    = 0.02 / 12,                 # 2% annual / 12, placeholder only
+    excess_return = log_return - rf_monthly
+  )
+
+# --- OPTION A template (uncomment and adapt once you have the file) ---
+# rf <- read_excel("data/risk_free.xlsx") %>%
+#   mutate(
+#     date       = as.Date(date),
+#     rf_monthly = (1 + rf_annual_pct/100)^(1/12) - 1   # convert annual to monthly
+#   ) %>%
+#   select(date, rf_monthly)
+#
+# panel <- panel %>%
+#   left_join(rf, by = "date") %>%
+#   mutate(excess_return = log_return - rf_monthly)
+
+# ---- 6. Stationarity tests on log returns (per index) ----
+# ADF: H0 = non-stationary (we want to REJECT, p < 0.05)
+# KPSS: H0 = stationary  (we do NOT want to reject, p > 0.05)
+cat("\n--- Stationarity tests (per index) ---\n")
+stationarity_results <- panel %>%
+  group_by(index_name) %>%
+  summarise(
+    adf_pvalue  = suppressWarnings(adf.test(log_return)$p.value),
+    kpss_pvalue = suppressWarnings(kpss.test(log_return)$p.value)
+  )
+print(stationarity_results)
+
+# ---- 7. Build cross-sectional dataset for the static regression ----
+# The model is cross-sectional: ONE observation per index, summarising performance
+# over the chosen period. Here we use mean monthly excess return as Perf_i.
+# (You can later split into "normal" vs "stress" subsamples.)
+
+cross_section <- panel %>%
+  group_by(index_name, esg_dummy, esg_score) %>%
+  summarise(
+    perf_mean   = mean(excess_return, na.rm = TRUE),
+    perf_sd     = sd(excess_return,   na.rm = TRUE),
+    sharpe_like = perf_mean / perf_sd,        # rough Sharpe ratio (monthly)
+    n_obs       = n(),
+    .groups = "drop"
+  )
+
+cat("\n--- Cross-sectional dataset ---\n")
+print(cross_section)
+
+# ---- 8. The static linear model ----
+# Perf_i = alpha + beta1 * ESG_dummy_i + beta2 * ESG_score_i + epsilon_i
+
+# Model 1: ESG dummy only (works with all 8 indices)
+model_1 <- lm(perf_mean ~ esg_dummy, data = cross_section)
+cat("\n=== Model 1: Perf ~ ESG dummy ===\n")
+print(summary(model_1))
+
+# Model 2: ESG dummy + ESG score (only runs once you fill in esg_score values)
+if (sum(!is.na(cross_section$esg_score)) >= 4) {
+  model_2 <- lm(perf_mean ~ esg_dummy + esg_score, data = cross_section)
+  cat("\n=== Model 2: Perf ~ ESG dummy + ESG score ===\n")
+  print(summary(model_2))
+
+  # Robust (heteroskedasticity-consistent) standard errors
+  cat("\n=== Model 2 with HC robust standard errors ===\n")
+  print(coeftest(model_2, vcov = vcovHC(model_2, type = "HC3")))
+} else {
+  message("\nModel 2 skipped: fill in esg_score values in the 'indices' table first.")
+}
+
+# ---- 9. Visualisation ----
+ggplot(cross_section, aes(x = factor(esg_dummy), y = perf_mean, label = index_name)) +
+  geom_boxplot(alpha = 0.3) +
+  geom_point(size = 3, colour = "steelblue") +
+  geom_text(vjust = -1, size = 3) +
+  scale_x_discrete(labels = c("0" = "Traditional", "1" = "ESG")) +
+  labs(
+    title = "Mean monthly excess return: ESG vs Traditional indices",
+    x = NULL,
+    y = "Mean monthly excess return"
+  ) +
+  theme_minimal()
+
+# ---- 10. Save outputs ----
+write.csv(cross_section,         "cross_section_results.csv", row.names = FALSE)
+write.csv(stationarity_results,  "stationarity_results.csv",  row.names = FALSE)
+saveRDS(panel, "panel_returns.rds")
+
+cat("\nDone. Results saved to your project folder.\n")
