@@ -44,21 +44,23 @@ indices <- tibble::tribble(
 read_index <- function(filepath) {
   raw <- read_excel(
     filepath,
-    sheet = 1,
-    skip  = 18,           # skip the 18 header/metadata rows -> row 19 becomes column names
+    sheet     = 1,
+    skip      = 18,
     col_names = TRUE
   )
-
-  # Keep only Date and Close, rename for clarity
+  
+  # Print names so we can verify (remove this line later)
+  message("Columns found: ", paste(names(raw), collapse = ", "))
+  
   df <- raw %>%
-    select(date = `Exchange Date`, close = Close) %>%
+    select(date = 1, close = 2) %>%    # ← select by position, not name
     filter(!is.na(date), !is.na(close)) %>%
     mutate(
-      date  = as.Date(date),
+      date  = as.Date(as.numeric(date), origin = "1899-12-30"),  # ← Excel serial date fix
       close = as.numeric(close)
     ) %>%
     arrange(date)
-
+  
   return(df)
 }
 
