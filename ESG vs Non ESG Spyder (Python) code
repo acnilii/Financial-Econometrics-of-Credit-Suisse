@@ -1,0 +1,296 @@
+# Code for Spyder (Python)
+# %% [1] IMPORTS AND SETTINGS
+# ===========================================================
+# Master Thesis - Static cross-sectional analysis
+# ESG vs traditional market indices
+# ===========================================================
+
+import os
+import glob
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+from statsmodels.stats.diagnostic import het_white
+from statsmodels.stats.stattools import jarque_bera
+from statsmodels.tsa.stattools import adfuller, kpss
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings("ignore")
+
+# ---- USER SETTINGS: edit this path to match YOUR Mac ----
+DATA_DIR = "/Users/YOUR_USERNAME/Desktop/Master_Thesis/data/market_indexes"
+# Tip: in Finder, right-click the folder → "Get Info" → copy the path from "Where:"
+# ----------------------------------------------------------
+
+pd.set_option("display.float_format", lambda x: f"{x:,.4f}")
+
+
+# %% [2] LOAD ALL INDEX EXCEL FILES
+# ===========================================================
+# Each file has the same layout (per your screenshot):
+#   - Header rows with metadata at the top
+#   - The actual price history table starts where the header
+#     row contains "Exchange Date", "Close", "Net", "%Chg", ...
+# We read each file, locate that header row dynamically,
+# then keep only Exchange Date and Close.
+# ===========================================================
+
+def load_index_file(filepath):
+    """Load one Refinitiv-style index Excel file and return a clean DataFrame."""
+    # Read the whole sheet without assuming a header
+    raw = pd.read_excel(filepath, header=None, engine="openpyxl")
+
+    # Find the row that contains "Exchange Date" — that's our real header
+    header_row = None
+    for i, row in raw.iterrows():
+        if row.astype(str).str.contains("Exchange Date", case=False, na=False).any():
+            header_row = i
+            break
+    if header_row is None:
+        raise ValueError(f"Could not find 'Exchange Date' header in {filepath}")
+
+    # Re-read using that row as header
+    df = pd.read_excel(filepath, header=header_row, engine="openpyxl")
+    df = df[["Exchange Date", "Close"]].dropna()
+    df["Exchange Date"] = pd.to_datetime(df["Exchange Date"], dayfirst=True, errors="coerce")
+    df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+    df = df.dropna().sort_values("Exchange Date").reset_index(drop=True)
+
+    # Use month-end as the index (data is monthly per your screenshot)
+    df["Date"] = df["Exchange Date"] + pd.offsets.MonthEnd(0)
+    df = df.set_index("Date")[["Close"]]
+    return df
+
+
+# Discover all xlsx files in the folder
+files = sorted(glob.glob(os.path.join(DATA_DIR, "*.xlsx")))
+print(f"Found {len(files)} files:")
+for f in files:
+    print("  -", os.path.basename(f))
+
+# Build one wide DataFrame: rows = months, columns = index name
+prices = pd.DataFrame()
+index_meta = []  # will store (name, ESG dummy)
+
+for f in files:
+    name = os.path.splitext(os.path.basename(f))[0]   # e.g. "MSCI World ESG"
+    series = load_index_file(f)["Close"].rename(name)
+    prices = pd.concat([prices, series], axis=1)
+
+    # ESG dummy: 1 if filename contains "ESG", "4Good", or "KLD Good"
+    # (KLD is a well-known ESG/SRI rating provider, and "4Good" = FTSE4Good
+    #  is explicitly an ESG/sustainability index)
+    name_lower = name.lower()
+    is_esg = int(("esg" in name_lower)
+                 or ("4good" in name_lower)
+                 or ("kld" in name_lower))
+    index_meta.append({"index": name, "esg_dummy": is_esg})
+
+meta = pd.DataFrame(index_meta)
+print("\nESG classification:")
+print(meta)
+
+
+# %% [3] COMPUTE LOG RETURNS
+# ===========================================================
+# Raw_Return_{i,t} = ln(P_{i,t} / P_{i,t-1})
+# ===========================================================
+
+prices = prices.sort_index()
+log_returns = np.log(prices / prices.shift(1)).dropna(how="all")
+
+print("\nLog returns - first rows:")
+print(log_returns.head())
+print("\nLog returns - summary statistics:")
+print(log_returns.describe())
+
+
+# %% [4] LOAD THE RISK-FREE RATE (1-month US T-Bill from FRED)
+# ===========================================================
+# Option A: automatic download via pandas_datareader
+# If this fails, see Option B below the cell
+# ===========================================================
+
+try:
+    from pandas_datareader import data as pdr
+    rf_annual = pdr.DataReader("DGS1MO", "fred",
+                               start=log_returns.index.min(),
+                               end=log_returns.index.max())
+    # FRED gives an ANNUALIZED percentage yield (e.g. 5.25 means 5.25%/year)
+    # Convert to a MONTHLY decimal rate
+    rf_monthly = (1 + rf_annual["DGS1MO"] / 100) ** (1/12) - 1
+    rf_monthly = rf_monthly.resample("M").last().ffill()
+    rf_monthly.name = "rf"
+    print("Risk-free rate downloaded from FRED.")
+except Exception as e:
+    print("Auto-download failed:", e)
+    print("Use Option B below: place a 'risk_free.csv' file in the data folder.")
+    # ---- OPTION B (manual fallback) ----
+    # Go to https://fred.stlouisfed.org/series/DGS1MO
+    # Click "Download" → CSV. Save as risk_free.csv next to your index files.
+    # The file should have columns: DATE, DGS1MO
+    rf_path = os.path.join(DATA_DIR, "risk_free.csv")
+    rf_raw = pd.read_csv(rf_path, parse_dates=["DATE"]).set_index("DATE")
+    rf_raw["DGS1MO"] = pd.to_numeric(rf_raw["DGS1MO"], errors="coerce")
+    rf_monthly = (1 + rf_raw["DGS1MO"] / 100) ** (1/12) - 1
+    rf_monthly = rf_monthly.resample("M").last().ffill()
+    rf_monthly.name = "rf"
+
+
+# %% [5] EXCESS RETURNS
+# ===========================================================
+# Excess_Return_{i,t} = Raw_Return_{i,t} - rf_t
+# ===========================================================
+
+# Align indexes
+log_returns.index = log_returns.index + pd.offsets.MonthEnd(0)
+rf_monthly.index = rf_monthly.index + pd.offsets.MonthEnd(0)
+
+excess = log_returns.subtract(rf_monthly, axis=0).dropna(how="all")
+print("\nExcess returns - first rows:")
+print(excess.head())
+
+
+# %% [6] STATIONARITY TESTS (ADF and KPSS)
+# ===========================================================
+# Your methodology requires verifying stationarity of returns.
+# ADF: H0 = unit root (non-stationary).  We want to REJECT H0.
+# KPSS: H0 = stationary.                  We want to NOT reject H0.
+# ===========================================================
+
+def stationarity_tests(series, name):
+    series = series.dropna()
+    adf_stat, adf_p, *_ = adfuller(series, autolag="AIC")
+    try:
+        kpss_stat, kpss_p, *_ = kpss(series, regression="c", nlags="auto")
+    except Exception:
+        kpss_stat, kpss_p = np.nan, np.nan
+    return {"index": name,
+            "ADF_stat": adf_stat, "ADF_pvalue": adf_p,
+            "KPSS_stat": kpss_stat, "KPSS_pvalue": kpss_p,
+            "ADF_stationary": adf_p < 0.05,
+            "KPSS_stationary": kpss_p > 0.05}
+
+stationarity = pd.DataFrame([stationarity_tests(excess[c], c) for c in excess.columns])
+print("\nStationarity tests on excess returns:")
+print(stationarity)
+
+
+# %% [7] BUILD THE CROSS-SECTIONAL DATASET
+# ===========================================================
+# For the static cross-sectional regression we need ONE row per index,
+# with its average performance over the sample (the dependent variable),
+# plus its characteristics (ESG dummy, ESG score, etc.).
+# ===========================================================
+
+# Dependent variable: mean monthly excess log return (annualized for readability)
+perf = pd.DataFrame({
+    "index": excess.columns,
+    "mean_excess_return_monthly": excess.mean().values,
+    "mean_excess_return_annualized": excess.mean().values * 12,
+    "volatility_monthly": excess.std().values,
+    "sharpe_ratio_monthly": (excess.mean() / excess.std()).values,
+    "sharpe_ratio_annualized": (excess.mean() / excess.std() * np.sqrt(12)).values,
+})
+
+# Merge with ESG metadata
+cross_section = perf.merge(meta, on="index")
+
+# ---- ADD YOUR ESG SCORES HERE WHEN YOU HAVE THEM ----
+# Replace the dictionary values below with the actual continuous ESG scores
+# (from MSCI, Sustainalytics, or whichever provider you use).
+# Until then, the regression will run with only the dummy.
+esg_scores = {
+    "FTSE All World":      np.nan,
+    "FTSE4Good All World": np.nan,
+    "MSCI KLD Good":       np.nan,
+    "MSCI US":             np.nan,
+    "MSCI World ESG":      np.nan,
+    "MSCI World":          np.nan,
+    "Stoxx ESG":           np.nan,
+    "Stoxx Global":        np.nan,
+}
+cross_section["esg_score"] = cross_section["index"].map(esg_scores)
+# -----------------------------------------------------
+
+print("\nCross-sectional dataset:")
+print(cross_section)
+
+
+# %% [8] STATIC OLS REGRESSION
+# ===========================================================
+# Model:  Perf_i = alpha + beta_1 * ESG_dummy_i (+ beta_2 * ESG_score_i) + e_i
+#
+# We choose mean monthly excess return as Perf_i.
+# (You can change the dependent variable to Sharpe ratio if preferred.)
+# ===========================================================
+
+DEP_VAR = "mean_excess_return_monthly"   # change to "sharpe_ratio_monthly" if you prefer
+
+# Decide which regressors to include based on data availability
+regressors = ["esg_dummy"]
+if cross_section["esg_score"].notna().all():
+    regressors.append("esg_score")
+    print("Running model WITH continuous ESG score.")
+else:
+    print("Running DUMMY-ONLY model (esg_score column has missing values).")
+    print("Fill in `esg_scores` dictionary in cell [7] to add the continuous score.")
+
+X = cross_section[regressors]
+X = sm.add_constant(X)            # adds the alpha (intercept)
+y = cross_section[DEP_VAR]
+
+model = sm.OLS(y, X).fit(cov_type="HC3")   # heteroskedasticity-robust SE
+print("\n" + "="*60)
+print("STATIC CROSS-SECTIONAL REGRESSION RESULTS")
+print("="*60)
+print(model.summary())
+
+
+# %% [9] DIAGNOSTICS
+# ===========================================================
+# Even with N=8 indices, run basic diagnostics for your appendix.
+# ===========================================================
+
+residuals = model.resid
+
+# Jarque-Bera normality test
+jb_stat, jb_p, skew, kurt = jarque_bera(residuals)
+print(f"\nJarque-Bera: stat={jb_stat:.3f}, p={jb_p:.3f}, skew={skew:.3f}, kurt={kurt:.3f}")
+
+# White's test for heteroskedasticity (only if enough degrees of freedom)
+try:
+    white_stat, white_p, _, _ = het_white(residuals, X)
+    print(f"White heteroskedasticity test: stat={white_stat:.3f}, p={white_p:.3f}")
+except Exception as e:
+    print(f"White test skipped (too few observations): {e}")
+
+# Quick visual: actual vs fitted
+plt.figure(figsize=(8, 5))
+plt.scatter(model.fittedvalues, y, s=80)
+for i, txt in enumerate(cross_section["index"]):
+    plt.annotate(txt, (model.fittedvalues.iloc[i], y.iloc[i]),
+                 fontsize=8, xytext=(5, 5), textcoords="offset points")
+plt.plot([y.min(), y.max()], [y.min(), y.max()], "r--", lw=1)
+plt.xlabel("Fitted values")
+plt.ylabel("Actual excess returns")
+plt.title("Static regression: actual vs fitted")
+plt.tight_layout()
+plt.show()
+
+
+# %% [10] EXPORT RESULTS
+# ===========================================================
+# Save outputs so you can include them in your thesis appendix.
+# ===========================================================
+
+OUT_DIR = os.path.join(os.path.dirname(DATA_DIR), "outputs")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+cross_section.to_csv(os.path.join(OUT_DIR, "cross_section_data.csv"), index=False)
+stationarity.to_csv(os.path.join(OUT_DIR, "stationarity_tests.csv"), index=False)
+
+with open(os.path.join(OUT_DIR, "regression_results.txt"), "w") as f:
+    f.write(model.summary().as_text())
+
+print(f"\nAll outputs saved to: {OUT_DIR}")
