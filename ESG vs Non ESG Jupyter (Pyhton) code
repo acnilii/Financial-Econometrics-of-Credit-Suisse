@@ -1,0 +1,237 @@
+#Code for Jupyter (Python)
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import statsmodels.api as sm
+from statsmodels.stats.diagnostic import het_breuschpagan
+from statsmodels.stats.stattools import jarque_bera
+from statsmodels.tsa.stattools import adfuller, kpss
+import warnings
+warnings.filterwarnings('ignore')
+
+pd.set_option('display.float_format', lambda x: f'{x:.4f}')
+sns.set_style('whitegrid')
+
+# === EDIT THIS PATH to point to your 'market indexes' folder ===
+DATA_FOLDER = 'market indexes'   # relative to the notebook location
+
+# === EDIT THESE ESG SCORES with your actual values from the providers ===
+# Keys MUST match the .xlsx filenames (without extension) exactly
+ESG_SCORES = {
+    'ESG FTSE4Good All World':  7.5,   # placeholder — replace with real score
+    'ESG MSCI KLD Good':        7.8,
+    'ESG MSCI World':           7.6,
+    'ESG Stoxx':                7.7,
+    'FTSE All World':           5.2,
+    'MSCI US':                  5.5,
+    'MSCI World':               5.4,
+    'Stoxx Global':             5.3,
+}
+
+print('Setup complete.')
+
+def load_index_file(filepath):
+    """Load one index Excel file and return a clean DataFrame with Date and Close."""
+    # Row 19 in Excel = index 18 in pandas (0-indexed)
+    df = pd.read_excel(filepath, header=18)
+
+    # Keep only the columns we need
+    df = df[['Exchange Date', 'Close']].copy()
+    df.columns = ['Date', 'Close']
+
+    # Drop empty rows
+    df = df.dropna(subset=['Date', 'Close'])
+
+    # Convert Date to datetime
+    df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+    df = df.dropna(subset=['Date'])
+
+    # Convert Close to numeric (handles European decimal commas if needed)
+    if df['Close'].dtype == object:
+        df['Close'] = (df['Close'].astype(str)
+                                  .str.replace('.', '', regex=False)
+                                  .str.replace(',', '.', regex=False))
+    df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
+    df = df.dropna(subset=['Close'])
+
+    # Sort chronologically (oldest first) and reset index
+    df = df.sort_values('Date').reset_index(drop=True)
+    return df
+
+# Quick test on one file — uncomment to verify it works:
+# test = load_index_file(os.path.join(DATA_FOLDER, 'FTSE All World.xlsx'))
+# print(test.head()); print(test.tail()); print(f'{len(test)} rows')
+
+all_data = []
+
+for fname in sorted(os.listdir(DATA_FOLDER)):
+    if not fname.endswith('.xlsx'):
+        continue
+
+    index_name = fname.replace('.xlsx', '')
+    filepath = os.path.join(DATA_FOLDER, fname)
+
+    df = load_index_file(filepath)
+    df['Index'] = index_name
+    df['ESG_dummy'] = 1 if index_name.startswith('ESG') else 0
+    df['ESG_score'] = ESG_SCORES.get(index_name, np.nan)
+
+    all_data.append(df)
+    print(f'  Loaded: {index_name:<30} | {len(df):>4} months | '
+          f'{df["Date"].min().date()} → {df["Date"].max().date()} | '
+          f'ESG={df["ESG_dummy"].iloc[0]}')
+
+panel = pd.concat(all_data, ignore_index=True)
+print(f'\nTotal observations across all indices: {len(panel)}')
+panel.head()
+
+
+panel = panel.sort_values(['Index', 'Date']).reset_index(drop=True)
+panel['LogReturn'] = panel.groupby('Index')['Close'].transform(
+    lambda x: np.log(x / x.shift(1))
+)
+
+# Drop the first observation per index (no return computable)
+panel = panel.dropna(subset=['LogReturn']).reset_index(drop=True)
+print('Log returns computed.')
+panel.groupby('Index')['LogReturn'].describe()
+
+
+from pandas_datareader import data as pdr
+
+rf_raw = pdr.DataReader('TB4WK', 'fred',
+                        start=panel['Date'].min(),
+                        end=panel['Date'].max())
+rf_raw = rf_raw.reset_index().rename(columns={'DATE': 'Date', 'TB4WK': 'RF_annual_pct'})
+
+# Convert annualized percent to monthly decimal
+rf_raw['RF_monthly'] = rf_raw['RF_annual_pct'] / 100 / 12
+
+# Align RF to month-end (your indices are end-of-month)
+rf_raw['YearMonth'] = rf_raw['Date'].dt.to_period('M')
+rf_monthly = rf_raw.groupby('YearMonth', as_index=False)['RF_monthly'].mean()
+
+panel['YearMonth'] = panel['Date'].dt.to_period('M')
+panel = panel.merge(rf_monthly, on='YearMonth', how='left')
+panel = panel.drop(columns=['YearMonth'])
+
+print(f'Risk-free rate merged. Missing values: {panel["RF_monthly"].isna().sum()}')
+panel.head()
+
+
+
+rf_raw = pd.read_csv('TB4WK.csv', parse_dates=['observation_date'])
+rf_raw = rf_raw.rename(columns={'observation_date': 'Date', 'TB4WK': 'RF_annual_pct'})
+rf_raw['RF_monthly'] = rf_raw['RF_annual_pct'] / 100 / 12
+rf_raw['YearMonth'] = rf_raw['Date'].dt.to_period('M')
+rf_monthly = rf_raw.groupby('YearMonth', as_index=False)['RF_monthly'].mean()
+panel['YearMonth'] = panel['Date'].dt.to_period('M')
+panel = panel.merge(rf_monthly, on='YearMonth', how='left').drop(columns=['YearMonth'])
+print(f'Risk-free rate merged. Missing values: {panel["RF_monthly"].isna().sum()}')
+
+
+
+panel['ExcessReturn'] = panel['LogReturn'] - panel['RF_monthly']
+panel = panel.dropna(subset=['ExcessReturn']).reset_index(drop=True)
+
+summary = panel.groupby('Index').agg(
+    N=('ExcessReturn', 'count'),
+    Mean=('ExcessReturn', 'mean'),
+    Std=('ExcessReturn', 'std'),
+    Min=('ExcessReturn', 'min'),
+    Max=('ExcessReturn', 'max'),
+    ESG_dummy=('ESG_dummy', 'first'),
+    ESG_score=('ESG_score', 'first'),
+)
+summary
+
+
+
+results = []
+for idx_name, group in panel.groupby('Index'):
+    series = group['ExcessReturn'].dropna()
+    adf_stat, adf_p, *_ = adfuller(series, autolag='AIC')
+    kpss_stat, kpss_p, *_ = kpss(series, regression='c', nlags='auto')
+    results.append({
+        'Index': idx_name,
+        'ADF_stat': adf_stat, 'ADF_p': adf_p,
+        'ADF_stationary (p<0.05)': adf_p < 0.05,
+        'KPSS_stat': kpss_stat, 'KPSS_p': kpss_p,
+        'KPSS_stationary (p>0.05)': kpss_p > 0.05,
+    })
+
+stationarity = pd.DataFrame(results)
+stationarity
+
+
+cross_section = panel.groupby('Index').agg(
+    Perf=('ExcessReturn', 'mean'),       # average monthly excess return
+    ESG_dummy=('ESG_dummy', 'first'),
+    ESG_score=('ESG_score', 'first'),
+).reset_index()
+
+print(cross_section)
+
+
+X = cross_section[['ESG_dummy', 'ESG_score']]
+X = sm.add_constant(X)
+y = cross_section['Perf']
+
+model_cs = sm.OLS(y, X, missing='drop').fit()
+print(model_cs.summary())
+
+
+panel_clean = panel.dropna(subset=['ExcessReturn', 'ESG_dummy', 'ESG_score']).copy()
+X_p = panel_clean[['ESG_dummy', 'ESG_score']]
+X_p = sm.add_constant(X_p)
+y_p = panel_clean['ExcessReturn']
+
+model_pooled = sm.OLS(y_p, X_p).fit(
+    cov_type='cluster',
+    cov_kwds={'groups': panel_clean['Index']}
+)
+print(model_pooled.summary())
+
+
+resid = model_cs.resid
+fitted = model_cs.fittedvalues
+
+# Jarque-Bera normality
+jb_stat, jb_p, skew, kurt = jarque_bera(resid)
+print(f'Jarque-Bera: stat={jb_stat:.3f}, p={jb_p:.3f}  (residuals normal if p > 0.05)')
+print(f'Skewness={skew:.3f}, Kurtosis={kurt:.3f}')
+
+# Breusch-Pagan heteroskedasticity
+bp_stat, bp_p, _, _ = het_breuschpagan(resid, X)
+print(f'Breusch-Pagan: stat={bp_stat:.3f}, p={bp_p:.3f}  (homoskedastic if p > 0.05)')
+
+# Visual diagnostics
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+axes[0].scatter(fitted, resid); axes[0].axhline(0, color='red', ls='--')
+axes[0].set_xlabel('Fitted'); axes[0].set_ylabel('Residuals'); axes[0].set_title('Residuals vs Fitted')
+sm.qqplot(resid, line='45', fit=True, ax=axes[1]); axes[1].set_title('Q-Q plot')
+axes[2].hist(resid, bins=8, edgecolor='black'); axes[2].set_title('Residual histogram')
+plt.tight_layout(); plt.show()
+
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+# Boxplot of monthly excess returns by group
+panel['Group'] = panel['ESG_dummy'].map({1: 'ESG', 0: 'Traditional'})
+sns.boxplot(data=panel, x='Group', y='ExcessReturn', ax=axes[0])
+axes[0].set_title('Distribution of monthly excess returns')
+axes[0].axhline(0, color='red', ls='--', alpha=0.5)
+
+# Average performance per index
+cs_sorted = cross_section.sort_values('Perf')
+colors = ['#2E86AB' if d == 1 else '#A23B72' for d in cs_sorted['ESG_dummy']]
+axes[1].barh(cs_sorted['Index'], cs_sorted['Perf'], color=colors)
+axes[1].set_xlabel('Mean monthly excess return')
+axes[1].set_title('Average performance per index (blue=ESG, purple=Traditional)')
+axes[1].axvline(0, color='black', lw=0.8)
+
+plt.tight_layout(); plt.show()
+
+
