@@ -22,14 +22,14 @@ library(stringr)   # string handling
 # (FTSE4Good and MSCI KLD are also ESG-labelled products even without "ESG" in the name)
 indices <- tibble::tribble(
   ~file,                          ~index_name,             ~esg_dummy, ~esg_score,
-  "FTSE All World.xlsx",          "FTSE All World",        0,          NA_real_,
-  "FTSE4Good All World.xlsx",     "FTSE4Good All World",   1,          NA_real_,
-  "MSCI KLD Good.xlsx",           "MSCI KLD 400 Social",   1,          NA_real_,
-  "MSCI US.xlsx",                 "MSCI US",               0,          NA_real_,
-  "MSCI World ESG.xlsx",          "MSCI World ESG",        1,          NA_real_,
-  "MSCI World.xlsx",              "MSCI World",            0,          NA_real_,
-  "Stoxx ESG.xlsx",               "STOXX Global ESG",      1,          NA_real_,
-  "Stoxx Global.xlsx",            "STOXX Global 1800",     0,          NA_real_
+  "FTSE All World.xlsx",          "FTSE All World",        0,          0,
+  "FTSE4Good All World.xlsx",     "FTSE4Good All World",   1,          1,
+  "MSCI KLD Good.xlsx",           "MSCI KLD 400 Social",   1,          1,
+  "MSCI US.xlsx",                 "MSCI US",               0,          0,
+  "MSCI World ESG.xlsx",          "MSCI World ESG",        1,          1,
+  "MSCI World.xlsx",              "MSCI World",            0,          0,
+  "Stoxx ESG.xlsx",               "STOXX Global ESG",      1,          1,
+  "Stoxx Global.xlsx",            "STOXX Global 1800",     0,          0
 )
 
 # >>> ACTION REQUIRED: Fill in esg_score values for ESG-labelled indices <
